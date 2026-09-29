@@ -54,7 +54,16 @@ type simResult struct {
 //     按拓扑序依据批量生效后的稳态输入重算，并在 t+delay 排队新事件。
 //  3. 排队只追加，从不取消先前已排队的事件（纯传输延迟），
 //     因此再快的连续变化也不会抹掉前一个待发跳变，窄脉冲可穿过门传播。
+//
+// delay_model 为 inertial 时改走 simulateInertial（每门至多一个候选、到期前可取消）。
 func (c *circuit) simulate() *simResult {
+	if c.req.DelayModel == "inertial" {
+		return c.simulateInertial()
+	}
+	return c.simulateTransport()
+}
+
+func (c *circuit) simulateTransport() *simResult {
 	n := len(c.names)
 	v := c.initialState()
 
@@ -182,6 +191,174 @@ func (c *circuit) simulate() *simResult {
 		for _, g := range gates {
 			nv := c.evalGate(g, v)
 			schedule(t+g.delay, g.index, nv)
+		}
+	}
+
+	return res
+}
+
+// simulateInertial 实现惯性延迟（inertial delay）回放。
+//
+// 与纯传输延迟不同：每个门在任意时刻至多保留一个“待发候选”，候选在门输入
+// 变化时按批量生效后的输入重算：
+//   - 新值等于门当前输出：候选永远不会改变输出，取消待发候选
+//     （输入窄脉冲在延迟到期前回落，候选被撤销，脉冲被滤掉）；
+//   - 新值不等于当前输出、且与待发候选同值：保留更早到期的候选，不重排；
+//   - 否则（无候选，或候选值不同）：取消旧候选，在 t+delay 排新候选。
+//
+// 候选到期时若已被更新或取消则跳过（懒删除），否则生效并向扇出传播。
+// 多级门各自独立过滤：只有真正到达输出端的跳变才会进入下一级。
+func (c *circuit) simulateInertial() *simResult {
+	n := len(c.names)
+	v := c.initialState()
+
+	// initV 必须独立保存：v 会在整个回放过程中被持续改写，
+	// 直接别名会让时间线的“初值”变成终态。
+	res := &simResult{
+		initV: append([]bool(nil), v...),
+		edges: make([][]Jump, n),
+	}
+
+	// 外部翻转分组：at -> 主输入索引。同一输入同刻翻转在编译期已拒绝。
+	external := make(map[int][]int)
+	extTimes := make(map[int]struct{})
+	for i := range c.req.Inputs {
+		in := &c.req.Inputs[i]
+		idx := c.idIndex[in.ID]
+		for _, ev := range in.Events {
+			external[ev.At] = append(external[ev.At], idx)
+			extTimes[ev.At] = struct{}{}
+		}
+	}
+
+	// gateOfNet：线网 -> 驱动它的门（主输入为 nil；待发事件只可能来自门输出）。
+	gateOfNet := make([]*compiledGate, n)
+	for _, g := range c.gates {
+		gateOfNet[g.index] = g
+	}
+
+	// 每门一个待发候选：pendAt[g.topo] 为候选到期时刻（0 表示无候选），
+	// pendVal[g.topo] 为候选到期值。
+	pendAt := make([]int, len(c.gates))
+	pendVal := make([]bool, len(c.gates))
+
+	// 待发事件堆；被替换/取消的旧候选仍留在堆中，到期时懒删除。
+	pending := &timeHeap{}
+	heap.Init(pending)
+
+	schedule := func(at int, g *compiledGate, value bool) {
+		pendAt[g.topo] = at
+		pendVal[g.topo] = value
+		heap.Push(pending, pendingItem{at: at, net: g.index, value: value})
+	}
+	cancel := func(g *compiledGate) {
+		pendAt[g.topo] = 0
+	}
+
+	// 下一拍时刻：外部事件与事件堆中较小者。
+	nextExternal := func() (int, bool) {
+		if len(extTimes) == 0 {
+			return 0, false
+		}
+		m := 0
+		for t := range extTimes {
+			if m == 0 || t < m {
+				m = t
+			}
+		}
+		return m, true
+	}
+
+	for {
+		tExt, hasExt := nextExternal()
+		if !hasExt && pending.Len() == 0 {
+			break
+		}
+		t := 0
+		switch {
+		case !hasExt:
+			t = (*pending)[0].at
+		case pending.Len() == 0:
+			t = tExt
+		case tExt < (*pending)[0].at:
+			t = tExt
+		default:
+			t = (*pending)[0].at
+		}
+
+		// changed：本拍批量生效后值真正发生变化的线网。
+		changed := make(map[int]bool)
+
+		// 1a. 外部翻转批量生效（不同主输入同刻翻转合法）。
+		if inputs, ok := external[t]; ok {
+			delete(extTimes, t)
+			for _, idx := range inputs {
+				nv := !v[idx] // 翻转语义
+				if nv != v[idx] {
+					v[idx] = nv
+					changed[idx] = true
+					res.edges[idx] = append(res.edges[idx], Jump{At: t, Value: nv})
+				}
+			}
+		}
+
+		// 1b. 到期门事件批量生效；候选已被替换/取消的在此懒删除，
+		// 到期值与当前值相同的同值事件直接丢弃（不产生跳变、不传播）。
+		for pending.Len() > 0 && (*pending)[0].at == t {
+			it := heap.Pop(pending).(pendingItem)
+			g := gateOfNet[it.net]
+			if g == nil || pendAt[g.topo] != it.at || pendVal[g.topo] != it.value {
+				continue // 旧候选已被更新或取消
+			}
+			pendAt[g.topo] = 0
+			if v[it.net] == it.value {
+				continue // 忽略同值重复事件：无跳变、不传播
+			}
+			v[it.net] = it.value
+			changed[it.net] = true
+			res.edges[it.net] = append(res.edges[it.net], Jump{At: t, Value: it.value})
+		}
+
+		if len(changed) == 0 {
+			continue
+		}
+
+		// 2. 收集受影响门（输入中有线网本拍真正变化）。
+		affected := make(map[*compiledGate]bool)
+		changedNets := make([]int, 0, len(changed))
+		for net := range changed {
+			changedNets = append(changedNets, net)
+		}
+		sort.Ints(changedNets)
+		for _, net := range changedNets {
+			for _, g := range c.fanout[net] {
+				affected[g] = true
+			}
+		}
+
+		// 每门每拍只重算一次；按拓扑序，依据批量生效后的输入值。
+		gates := make([]*compiledGate, 0, len(affected))
+		for g := range affected {
+			gates = append(gates, g)
+		}
+		sort.Slice(gates, func(a, b int) bool { return gates[a].topo < gates[b].topo })
+
+		// 3. 惯性延迟：候选值等于当前输出则取消（滤脉冲）；
+		//    否则保留更早的同值候选，或取消旧候选并重排。
+		for _, g := range gates {
+			nv := c.evalGate(g, v)
+			if nv == v[g.index] {
+				// 候选不会改变输出：待发候选撤销，窄脉冲不到达。
+				cancel(g)
+				continue
+			}
+			if pendAt[g.topo] != 0 {
+				if pendVal[g.topo] == nv {
+					continue // 同值候选已在更早时刻排队，保留即可
+				}
+				cancel(g)
+			}
+			schedule(t+g.delay, g, nv)
 		}
 	}
 

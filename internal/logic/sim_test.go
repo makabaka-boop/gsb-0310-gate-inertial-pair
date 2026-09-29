@@ -278,10 +278,217 @@ func TestTimelineInitNotFinal(t *testing.T) {
 	}
 }
 
-// ---- 对拍：事件驱动引擎 vs 独立逐时刻参考模拟器 ----
+// ---- 惯性延迟（inertial delay）----
+
+// TestInertialFiltersShortPulse 故障主场景：
+// NOT 门延迟 3，输入端 t1->t2 的窄脉冲（宽 1 < 3）必须被惯性滤掉，
+// 观察点在 t4、t5 不得有任何跳变，脉冲列表也不得把它当作穿过门的信号。
+func TestInertialFiltersShortPulse(t *testing.T) {
+	req := &Request{
+		Inputs:      []Input{{ID: "a", Init: false, Events: []Event{{At: 1}, {At: 2}}}},
+		Gates:       []Gate{gate(NOT, "w", 3, "a")},
+		Observe:     []string{"w"},
+		GlitchWidth: 3,
+		DelayModel:  "inertial",
+	}
+	c, err := compile(req)
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	res := c.simulate()
+	assertEdges(t, c, res, "w", nil)
+	if resp := c.buildResponse(res); len(resp.Pulses) != 0 {
+		t.Fatalf("惯性模式下窄脉冲应被滤掉、无脉冲上报: %+v", resp.Pulses)
+	}
+
+	// 同一请求切回 transport：脉冲穿过门，t4=0、t5=1，两种模式时间线不同。
+	req.DelayModel = "transport"
+	c2, err := compile(req)
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	res2 := c2.simulate()
+	assertEdges(t, c2, res2, "w", []Jump{{At: 4, Value: false}, {At: 5, Value: true}})
+}
+
+// TestInertialWidthEqualsDelayPasses 脉冲宽度恰好等于延迟时应通过：
+// 候选在整个延迟期间持续成立，到期翻转（宽 3 == 延迟 3，不满足“严格小于”）。
+func TestInertialWidthEqualsDelayPasses(t *testing.T) {
+	req := &Request{
+		Inputs:     []Input{{ID: "a", Init: false, Events: []Event{{At: 1}, {At: 4}}}},
+		Gates:      []Gate{gate(NOT, "w", 3, "a")},
+		Observe:    []string{"w"},
+		DelayModel: "inertial",
+	}
+	c, err := compile(req)
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	res := c.simulate()
+	assertEdges(t, c, res, "w", []Jump{{At: 4, Value: false}, {At: 7, Value: true}})
+}
+
+// TestInertialMultiInputSameTick 多输入与门同刻变化：
+// a、b 同刻升起后又在延迟到期前先后回落，候选被撤销，输出不得出现短暂跳变。
+func TestInertialMultiInputSameTick(t *testing.T) {
+	// a、b 初始均为 0，z = AND(a,b) 初始 0。
+	// t1 两者同刻升起 -> 候选 z=1@t4；t2 a 回落 -> 新值=0 等于当前输出，候选撤销。
+	// z 始终为 0，无跳变。
+	req := &Request{
+		Inputs: []Input{
+			{ID: "a", Init: false, Events: []Event{{At: 1}, {At: 2}}},
+			{ID: "b", Init: false, Events: []Event{{At: 1}}},
+		},
+		Gates:       []Gate{gate(AND, "z", 3, "a", "b")},
+		Observe:     []string{"z"},
+		GlitchWidth: 3,
+		DelayModel:  "inertial",
+	}
+	c, err := compile(req)
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	res := c.simulate()
+	assertEdges(t, c, res, "z", nil)
+	if resp := c.buildResponse(res); len(resp.Pulses) != 0 {
+		t.Fatalf("同刻变化被惯性滤掉，不应有脉冲: %+v", resp.Pulses)
+	}
+
+	// 对照：transport 下窄脉冲穿过，z 在 t4=1、t5=0。
+	req.DelayModel = "transport"
+	c2, _ := compile(req)
+	res2 := c2.simulate()
+	assertEdges(t, c2, res2, "z", []Jump{{At: 4, Value: true}, {At: 5, Value: false}})
+}
+
+// TestInertialMultiStageDifferentDelays 脉冲经过延迟不同的多级门：
+// 宽 1 的脉冲穿过延迟 1 的 g1，却在延迟 3 的 g2 被惯性滤掉，
+// 后续级不得出现短暂跳变；每一级独立过滤。
+func TestInertialMultiStageDifferentDelays(t *testing.T) {
+	req := &Request{
+		Inputs: []Input{{ID: "a", Init: false, Events: []Event{{At: 1}, {At: 2}}}},
+		Gates: []Gate{
+			gate(NOT, "g1", 1, "a"),
+			gate(NOT, "g2", 3, "g1"),
+			gate(NOT, "g3", 2, "g2"),
+		},
+		Observe:    []string{"g1", "g2", "g3"},
+		DelayModel: "inertial",
+	}
+	c, err := compile(req)
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	res := c.simulate()
+	// g1=!a 延迟1：宽1脉冲（1 不小于 1）通过 -> t2=0、t3=1。
+	assertEdges(t, c, res, "g1", []Jump{{At: 2, Value: false}, {At: 3, Value: true}})
+	// g2=!g1 延迟3：输入脉冲宽 1 < 3 被滤掉，g2 始终为 0。
+	assertEdges(t, c, res, "g2", nil)
+	// g3=!g2 延迟2：g2 无跳变，g3 始终为 1。
+	assertEdges(t, c, res, "g3", nil)
+
+	// 对照：transport 下脉冲逐级传播，g2/g3 出现跳变。
+	req.DelayModel = "transport"
+	c2, _ := compile(req)
+	res2 := c2.simulate()
+	assertEdges(t, c2, res2, "g2", []Jump{{At: 5, Value: true}, {At: 6, Value: false}})
+	assertEdges(t, c2, res2, "g3", []Jump{{At: 7, Value: false}, {At: 8, Value: true}})
+}
+
+// TestInertialRisingStays 同刻升起且保持：候选完整延迟期间成立，正常翻转。
+func TestInertialRisingStays(t *testing.T) {
+	req := &Request{
+		Inputs: []Input{
+			{ID: "a", Init: false, Events: []Event{{At: 1}}},
+			{ID: "b", Init: false, Events: []Event{{At: 1}}},
+		},
+		Gates:      []Gate{gate(AND, "z", 3, "a", "b")},
+		Observe:    []string{"z"},
+		DelayModel: "inertial",
+	}
+	c, err := compile(req)
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	res := c.simulate()
+	assertEdges(t, c, res, "z", []Jump{{At: 4, Value: true}})
+}
+
+// TestInertialCrossCheckRandom 随机电路：惯性引擎 vs 独立稠密参考逐跳对拍。
+func TestInertialCrossCheckRandom(t *testing.T) {
+	rng := rand.New(rand.NewSource(778899))
+	for iter := 0; iter < 400; iter++ {
+		req := genRandomDAGWithNot(rng)
+		crossCheckInertial(t, req)
+	}
+}
+
+// TestInertialCrossCheckHandcrafted 手工电路在惯性模式下与参考对拍。
+func TestInertialCrossCheckHandcrafted(t *testing.T) {
+	cases := []*Request{
+		// 重汇毛刺（惯性下窄脉冲被滤）
+		{
+			Inputs: []Input{
+				{ID: "A", Init: false, Events: []Event{{At: 1}}},
+				{ID: "B", Init: false},
+			},
+			Gates: []Gate{
+				gate(NOT, "nb", 1, "B"),
+				gate(OR, "hold", 1, "B", "nb"),
+				gate(AND, "g1", 1, "A", "hold"),
+				gate(XOR, "z", 1, "g1", "A"),
+			},
+		},
+		// 同刻抵消 + 多输入
+		{
+			Inputs: []Input{
+				{ID: "p", Init: true, Events: []Event{{At: 1}}},
+				{ID: "q", Init: true, Events: []Event{{At: 1}}},
+				{ID: "r", Init: false, Events: []Event{{At: 1}, {At: 4}}},
+			},
+			Gates: []Gate{
+				gate(XOR, "x", 2, "p", "q", "r"),
+				gate(AND, "y", 3, "p", "r"),
+				gate(OR, "zz", 1, "x", "y"),
+			},
+		},
+		// 多级链（延迟各异）
+		{
+			Inputs: []Input{{ID: "a", Init: false, Events: []Event{{At: 1}, {At: 2}, {At: 10}}}},
+			Gates: []Gate{
+				gate(NOT, "g1", 1, "a"),
+				gate(NOT, "g2", 3, "g1"),
+				gate(NOT, "g3", 2, "g2"),
+				gate(AND, "g4", 8, "g3", "a"),
+			},
+		},
+		// 无任何外部事件
+		{
+			Inputs: []Input{{ID: "a", Init: true}, {ID: "b", Init: false}},
+			Gates: []Gate{
+				gate(XOR, "x", 1, "a", "b"),
+				gate(NOT, "y", 2, "x"),
+			},
+		},
+	}
+	for i, req := range cases {
+		t.Run(fmt.Sprintf("case%d", i), func(t *testing.T) { crossCheckInertial(t, req) })
+	}
+}
 
 func crossCheck(t *testing.T, req *Request) {
 	t.Helper()
+	crossCheckModel(t, req, "transport")
+}
+
+func crossCheckInertial(t *testing.T, req *Request) {
+	t.Helper()
+	crossCheckModel(t, req, "inertial")
+}
+
+func crossCheckModel(t *testing.T, req *Request, model string) {
+	t.Helper()
+	req.DelayModel = model
 	c, err := compile(req)
 	if err != nil {
 		t.Fatalf("compile: %v", err)
@@ -289,7 +496,11 @@ func crossCheck(t *testing.T, req *Request) {
 	got := c.simulate()
 
 	ref := refBuild(t, req)
-	ref.run()
+	if model == "inertial" {
+		ref.runInertial()
+	} else {
+		ref.run()
+	}
 
 	if len(got.edges) != len(ref.edges) {
 		t.Fatalf("线网数量不一致: %d vs %d", len(got.edges), len(ref.edges))

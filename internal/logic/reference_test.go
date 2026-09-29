@@ -235,3 +235,82 @@ func (r *refSim) run() {
 		}
 	}
 }
+
+// runInertial 是与 run 独立的惯性延迟稠密参考实现：
+// 每个门至多一个待发候选 pendAt/pendVal。候选到期生效；输入变化后重算——
+// 新值等于当前输出则撤销候选，与候选同值则保留更早的，否则替换候选。
+func (r *refSim) runInertial() {
+	r.initState()
+	r.initV = append([]bool(nil), r.v...)
+	r.edges = make([][]Jump, len(r.names))
+	r.ext = map[int][]int{}
+	for i := range r.req.Inputs {
+		in := &r.req.Inputs[i]
+		for _, ev := range in.Events {
+			r.ext[ev.At] = append(r.ext[ev.At], r.idx[in.ID])
+		}
+	}
+
+	pendAt := make([]int, len(r.gates)) // 0 = 无候选
+	pendVal := make([]bool, len(r.gates))
+
+	H := r.horizon()
+	for t := 1; t <= H; t++ {
+		changed := map[int]bool{}
+
+		// 1a. 外部翻转批量生效。
+		for _, net := range r.ext[t] {
+			nv := !r.v[net]
+			r.v[net] = nv
+			changed[net] = true
+			r.edges[net] = append(r.edges[net], Jump{At: t, Value: nv})
+		}
+		// 1b. 到期候选批量生效；同值重复事件忽略。
+		for gk, rg := range r.gates {
+			if pendAt[gk] != t {
+				continue
+			}
+			nv := pendVal[gk]
+			pendAt[gk] = 0
+			if r.v[rg.out] == nv {
+				continue
+			}
+			r.v[rg.out] = nv
+			changed[rg.out] = true
+			r.edges[rg.out] = append(r.edges[rg.out], Jump{At: t, Value: nv})
+		}
+
+		if len(changed) == 0 {
+			continue
+		}
+		// 2. 每门每拍至多一次重算，按拓扑序。
+		affected := map[int]bool{}
+		for net := range changed {
+			for _, gk := range r.fanout[net] {
+				affected[gk] = true
+			}
+		}
+		gks := make([]int, 0, len(affected))
+		for k := range affected {
+			gks = append(gks, k)
+		}
+		sort.Ints(gks)
+		// 3. 惯性延迟：候选值等于当前输出则取消；同值保留更早候选；否则替换。
+		for _, k := range gks {
+			rg := r.gates[k]
+			nv := r.eval(rg)
+			if nv == r.v[rg.out] {
+				pendAt[k] = 0
+				continue
+			}
+			if pendAt[k] != 0 {
+				if pendVal[k] == nv {
+					continue // 保留更早到期的同值候选
+				}
+				pendAt[k] = 0
+			}
+			pendAt[k] = t + rg.delay
+			pendVal[k] = nv
+		}
+	}
+}
