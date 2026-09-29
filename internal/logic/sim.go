@@ -52,8 +52,12 @@ type simResult struct {
 //     到期值与当前值相同的同值事件直接丢弃（不产生跳变、不传播）。
 //  2. 收集“本拍有输入真正变化”的门（每门每拍至多重算一次），
 //     按拓扑序依据批量生效后的稳态输入重算，并在 t+delay 排队新事件。
-//  3. 排队只追加，从不取消先前已排队的事件（纯传输延迟），
+//  3. 延迟模型由 req.DelayModel 决定：
+//     - transport（默认）：排队只追加，从不取消先前已排队的事件，
 //     因此再快的连续变化也不会抹掉前一个待发跳变，窄脉冲可穿过门传播。
+//     - inertial：每门至多一个候选事件。重算出的候选值必须持续成立
+//     满整个门延迟才到达输出；到期前候选值不再成立（输入变化使重算
+//     结果回到当前输出）则旧候选失效，宽度不足延迟的窄脉冲被吞掉。
 func (c *circuit) simulate() *simResult {
 	n := len(c.names)
 	v := c.initialState()
@@ -82,6 +86,11 @@ func (c *circuit) simulate() *simResult {
 	heap.Init(pending)
 	pendingSet := make(map[eventKey]bool)
 
+	// 惯性延迟：每门至多一个候选事件，线网 -> 候选键。
+	// 传输模式下该映射始终为空。
+	inertial := c.req.DelayModel == "inertial"
+	gatePending := make(map[int]eventKey)
+
 	schedule := func(at, net int, value bool) {
 		key := eventKey{at, net}
 		if pendingSet[key] {
@@ -91,6 +100,15 @@ func (c *circuit) simulate() *simResult {
 		}
 		pendingSet[key] = true
 		heap.Push(pending, pendingItem{at: at, net: net, value: value})
+	}
+
+	// cancelCandidate 使某门尚未到期的惯性候选失效。
+	// 懒删除：堆中元素保留，弹出时发现不在 pendingSet 即跳过。
+	cancelCandidate := func(net int) {
+		if key, ok := gatePending[net]; ok {
+			delete(pendingSet, key)
+			delete(gatePending, net)
+		}
 	}
 
 	// 下一拍时刻：外部事件与事件堆中较小者。
@@ -108,6 +126,12 @@ func (c *circuit) simulate() *simResult {
 	}
 
 	for {
+		// 堆顶若是已取消的惯性候选，先丢弃，保证堆顶即下一个真实事件。
+		// 传输模式从不取消，此循环恒不执行。
+		for pending.Len() > 0 && !pendingSet[eventKey{(*pending)[0].at, (*pending)[0].net}] {
+			heap.Pop(pending)
+		}
+
 		tExt, hasExt := nextExternal()
 		if !hasExt && pending.Len() == 0 {
 			break
@@ -143,7 +167,12 @@ func (c *circuit) simulate() *simResult {
 		// 1b. 到期门事件批量生效；同值重复事件在此被忽略。
 		for pending.Len() > 0 && (*pending)[0].at == t {
 			it := heap.Pop(pending).(pendingItem)
-			delete(pendingSet, eventKey{it.at, it.net})
+			key := eventKey{it.at, it.net}
+			if !pendingSet[key] {
+				continue // 已取消的惯性候选（懒删除）
+			}
+			delete(pendingSet, key)
+			delete(gatePending, it.net) // 惯性候选到期即消费
 			if v[it.net] == it.value {
 				continue // 忽略同值重复事件：无跳变、不传播
 			}
@@ -176,12 +205,32 @@ func (c *circuit) simulate() *simResult {
 		}
 		sort.Slice(gates, func(a, b int) bool { return gates[a].topo < gates[b].topo })
 
-		// 3. 只追加、不取消：即使算出的值与当前输出相同也照样排队，
-		// 到期时若已相同则作为同值事件忽略；这保证中途其它路径
-		// 把输出拉走时，本事件仍能在到期时把它拉回，形成窄脉冲。
+		// 3. 按延迟模型排队。
 		for _, g := range gates {
 			nv := c.evalGate(g, v)
-			schedule(t+g.delay, g.index, nv)
+			if !inertial {
+				// 纯传输：只追加、不取消。即使算出的值与当前输出
+				// 相同也照样排队，到期时若已相同则作为同值事件忽略；
+				// 这保证中途其它路径把输出拉走时，本事件仍能在到期时
+				// 把它拉回，形成窄脉冲。
+				schedule(t+g.delay, g.index, nv)
+				continue
+			}
+			// 惯性延迟：候选值必须持续成立满整个门延迟。
+			switch {
+			case nv == v[g.index]:
+				// 重算结果回到当前输出：旧候选在到期前失效，
+				// 宽度不足延迟的窄脉冲被吞掉；候选值等于当前
+				// 门输出本就不应制造跳变，无需再排队。
+				cancelCandidate(g.index)
+			default:
+				if _, ok := gatePending[g.index]; !ok {
+					// 无待发候选：从本变化时刻起算延迟。
+					// 已有同值候选则持续成立，保留原候选不重新计时。
+					schedule(t+g.delay, g.index, nv)
+					gatePending[g.index] = eventKey{t + g.delay, g.index}
+				}
+			}
 		}
 	}
 

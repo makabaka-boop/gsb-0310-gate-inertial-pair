@@ -27,6 +27,10 @@ type refSim struct {
 	initV  []bool // 初始稳态快照（不随后续模拟改写）
 	edges  [][]Jump
 
+	inertial bool  // 惯性延迟模式（req.DelayModel == "inertial"）
+	gateOf   []int // 线网 -> 门序号；-1 表示主输入
+	pend     []int // 门序号 -> 待发候选的到期时刻；-1 表示无候选（仅惯性模式使用）
+
 	// ext[t] = 本拍翻转的主输入索引
 	ext map[int][]int
 	// bucket[t] = 本拍到期的门事件：输出线网 -> 到期值
@@ -110,6 +114,14 @@ func refBuild(t *testing.T, req *Request) *refSim {
 			r.fanout[in] = append(r.fanout[in], k)
 		}
 	}
+	r.inertial = req.DelayModel == "inertial"
+	r.gateOf = make([]int, len(r.names))
+	for i := range r.gateOf {
+		r.gateOf[i] = -1
+	}
+	for k, rg := range ordered {
+		r.gateOf[rg.out] = k
+	}
 	return r
 }
 
@@ -187,6 +199,10 @@ func (r *refSim) run() {
 		}
 	}
 	r.bucket = map[int]map[int]bool{}
+	r.pend = make([]int, len(r.gates))
+	for k := range r.pend {
+		r.pend[k] = -1
+	}
 
 	H := r.horizon()
 	for t := 1; t <= H; t++ {
@@ -201,6 +217,9 @@ func (r *refSim) run() {
 		}
 		// 1b. 到期门事件批量生效；同值重复事件忽略。
 		for net, nv := range r.bucket[t] {
+			if gk := r.gateOf[net]; gk >= 0 {
+				r.pend[gk] = -1 // 惯性候选到期即消费
+			}
 			if r.v[net] == nv {
 				continue
 			}
@@ -228,10 +247,29 @@ func (r *refSim) run() {
 		for _, k := range gks {
 			rg := r.gates[k]
 			nv := r.eval(rg)
-			if r.bucket[t+rg.delay] == nil {
-				r.bucket[t+rg.delay] = map[int]bool{}
+			if !r.inertial {
+				if r.bucket[t+rg.delay] == nil {
+					r.bucket[t+rg.delay] = map[int]bool{}
+				}
+				r.bucket[t+rg.delay][rg.out] = nv // 只追加、不取消
+				continue
 			}
-			r.bucket[t+rg.delay][rg.out] = nv // 只追加、不取消
+			// 惯性延迟：候选值须持续成立满整个门延迟。
+			switch {
+			case nv == r.v[rg.out]:
+				// 候选在到期前失效：从时间桶中撤下，窄脉冲被吞。
+				if r.pend[k] >= 0 {
+					delete(r.bucket[r.pend[k]], rg.out)
+					r.pend[k] = -1
+				}
+			case r.pend[k] < 0:
+				// 无待发候选才排队；已有同值候选则持续成立，保留不重新计时。
+				if r.bucket[t+rg.delay] == nil {
+					r.bucket[t+rg.delay] = map[int]bool{}
+				}
+				r.bucket[t+rg.delay][rg.out] = nv
+				r.pend[k] = t + rg.delay
+			}
 		}
 	}
 }
